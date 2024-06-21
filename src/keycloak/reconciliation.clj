@@ -80,30 +80,35 @@
                           steps    (get plan steps-key)]
                       [steps-key (apply-steps apply-fn steps-key steps)])) (keys config))))
 
+(defn skip-plan?
+  "Getting all the users and their groups can take a long time,
+   IF the desired entities are empty AND the apply-deletions is false we skip the whole plan"
+  [desired-entities opts]
+  (not (or (seq desired-entities) (:apply-deletions? opts))))
+
 
 (defn users-plan [keycloak-client realm-name desired-users & [opts]]
   ;;as getting all the users and their groups can take a long time, IF the desired-users are empty AND the apply-deletions is false we skip the whole plan
-  (let [skip-everything? (not (or (seq desired-users) (:apply-deletions? opts)))]
-    (if skip-everything?
-      {:user/updates nil :user/deletions nil :user/additions nil}
-      (let [current-users          (->> (user/get-users keycloak-client realm-name);vector of UserRepresentation
-                                        (map bean/UserRepresentation->map)
-                                        ;;now retrieve the user groups in a separate parallel calls
-                                        (pmap (fn [user]
-                                                (when (:id user)
-                                                  (let [groups (admin/get-user-groups keycloak-client realm-name (:id user))]
-                                                    (when groups
-                                                      (assoc user :groups (map #(select-keys (bean/GroupRepresentation->map %) [:path]) groups)))))))
-                                        (map #(dissoc % :id)))
-            filtered-desired-users (->> desired-users
-                                        (map (fn [user]
-                                               (if (and (not (:groups user)) (:group user) (:in-subgroups user))
-                                                 (assoc user :groups (map (fn [subgroup] (str "/" (:group user) "/" subgroup))(:in-subgroups user)))
-                                                 user))))]
-        (utils/pprint-to-file (str "/tmp/" realm-name "-current-users.edn") current-users)
-        {:user/updates   (find-differents :username current-users filtered-desired-users [:username :first-name :last-name :email :attributes :groups])
-         :user/deletions (find-deletions  :username current-users desired-users)
-         :user/additions (find-additions  :username current-users desired-users)}))))
+  (if (skip-plan? desired-users opts)
+    {:user/updates nil :user/deletions nil :user/additions nil}
+    (let [current-users          (->> (user/get-users keycloak-client realm-name);vector of UserRepresentation
+                                      (map bean/UserRepresentation->map)
+                                      ;;now retrieve the user groups in a separate parallel calls
+                                      (pmap (fn [user]
+                                              (when (:id user)
+                                                (let [groups (admin/get-user-groups keycloak-client realm-name (:id user))]
+                                                  (when groups
+                                                    (assoc user :groups (map #(select-keys (bean/GroupRepresentation->map %) [:path]) groups)))))))
+                                      (map #(dissoc % :id)))
+          filtered-desired-users (->> desired-users
+                                      (map (fn [user]
+                                             (if (and (not (:groups user)) (:group user) (:in-subgroups user))
+                                               (assoc user :groups (map (fn [subgroup] (str "/" (:group user) "/" subgroup))(:in-subgroups user)))
+                                               user))))]
+      (utils/pprint-to-file (str "/tmp/" realm-name "-current-users.edn") current-users)
+      {:user/updates   (find-differents :username current-users filtered-desired-users [:username :first-name :last-name :email :attributes :groups])
+       :user/deletions (find-deletions  :username current-users desired-users)
+       :user/additions (find-additions  :username current-users desired-users)})))
 
 (defn apply-users-plan! [keycloak-client realm-name plan & [opts]]
   (let [apply-deletions? (or (:apply-deletions? opts) false)
@@ -191,33 +196,38 @@
   (let [subgroup-path (str "/" parent-group-name "/" (:name subgroup))]
     (assoc subgroup :path subgroup-path)))
 
-(defn groups-plan [keycloak-client realm-name desired-groups]
-  (let [current-groups         (map bean/GroupRepresentation->map (admin/list-groups keycloak-client realm-name))
-        current-groups-by-id   (utils/associate-by :id current-groups)
-        current-groups-by-name (utils/associate-by :name current-groups)]
-    (utils/pprint-to-file (str "/tmp/" realm-name "-current-groups.edn") current-groups)
-    {:groups/additions    (find-additions :name current-groups desired-groups)
-     :groups/deletions    (find-deletions :name current-groups desired-groups)
-     :subgroups/additions (mapcat (fn [{:keys [name subgroups] :as desired-group}]
-                                    (let [current-group     (get current-groups-by-name name)
-                                          group-id          (:id current-group)
-                                          current-subgroups (map bean/GroupRepresentation->map (:subGroups current-group))]
-                                      (when group-id
-                                        (map (fn [subgroup-to-add]
-                                               (-> subgroup-to-add
-                                                   (assoc :parent-group-id group-id)
-                                                   (assoc :parent-group-name name))) (find-additions :path current-subgroups (map (partial subgroup-path name) subgroups)))))) desired-groups)
-     :subgroups/deletions (mapcat (fn [{:keys [name subgroups] :as desired-group}]
-                                    (let [current-group     (get current-groups-by-name name)
-                                          group-id          (:id current-group)
-                                          current-subgroups (map bean/GroupRepresentation->map (:subGroups current-group))]
-                                      (when group-id
-                                        (map (fn [subgroup-to-delete]
-                                               (-> subgroup-to-delete
-                                                   (assoc :id (admin/get-subgroup-id keycloak-client realm-name group-id (:name subgroup-to-delete)))
-                                                   (assoc :parent-group-id group-id)
-                                                   (assoc :parent-group-name name)))
-                                             (find-deletions :path current-subgroups (map (partial subgroup-path name) subgroups)))))) desired-groups)}))
+(defn groups-plan [keycloak-client realm-name desired-groups & [opts]]
+  (if (skip-plan? desired-groups opts)
+    {:groups/additions nil
+     :groups/deletions nil
+     :subgroups/additions nil
+     :subgroups/deletions nil}
+    (let [current-groups         (map bean/GroupRepresentation->map (admin/list-groups keycloak-client realm-name))
+          current-groups-by-id   (utils/associate-by :id current-groups)
+          current-groups-by-name (utils/associate-by :name current-groups)]
+      (utils/pprint-to-file (str "/tmp/" realm-name "-current-groups.edn") current-groups)
+      {:groups/additions    (find-additions :name current-groups desired-groups)
+       :groups/deletions    (find-deletions :name current-groups desired-groups)
+       :subgroups/additions (mapcat (fn [{:keys [name subgroups] :as desired-group}]
+                                      (let [current-group     (get current-groups-by-name name)
+                                            group-id          (:id current-group)
+                                            current-subgroups (map bean/GroupRepresentation->map (:subGroups current-group))]
+                                        (when group-id
+                                          (map (fn [subgroup-to-add]
+                                                 (-> subgroup-to-add
+                                                     (assoc :parent-group-id group-id)
+                                                     (assoc :parent-group-name name))) (find-additions :path current-subgroups (map (partial subgroup-path name) subgroups)))))) desired-groups)
+       :subgroups/deletions (mapcat (fn [{:keys [name subgroups] :as desired-group}]
+                                      (let [current-group     (get current-groups-by-name name)
+                                            group-id          (:id current-group)
+                                            current-subgroups (map bean/GroupRepresentation->map (:subGroups current-group))]
+                                        (when group-id
+                                          (map (fn [subgroup-to-delete]
+                                                 (-> subgroup-to-delete
+                                                     (assoc :id (admin/get-subgroup-id keycloak-client realm-name group-id (:name subgroup-to-delete)))
+                                                     (assoc :parent-group-id group-id)
+                                                     (assoc :parent-group-name name)))
+                                               (find-deletions :path current-subgroups (map (partial subgroup-path name) subgroups)))))) desired-groups)})))
 
 
 (defn apply-groups-plan! [keycloak-client realm-name plan & [opts]]
